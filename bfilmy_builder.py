@@ -83,13 +83,12 @@ except ImportError:
 # ============================================================
 
 # GitHub Actions runners: 7 GB RAM, 2 cores, ephemeral disk.
-MAX_CONCURRENCY = 40
-PARSE_THREADS = 4
-DB_QUEUE_DEPTH = 12
+MAX_CONCURRENCY = 80
+PARSE_THREADS = 6
+DB_QUEUE_DEPTH = 24
 
-FLUSH_EVERY_N_FILES = 30
-FLUSH_MAX_ROWS = 50_000
-JSON_REBUILD_EVERY_N_BATCHES = 10
+FLUSH_EVERY_N_FILES = 40
+FLUSH_MAX_ROWS = 75_000
 
 REQUEST_TIMEOUT = 90
 CONNECT_TIMEOUT = 20
@@ -189,23 +188,37 @@ def today_ist() -> dt.date:
 
 
 def get_time_slot(value: Any) -> str | None:
+    """
+    Match FinalDetailedJson.js getTimeSlot() + canonSlot() exactly:
+
+      04:00-11:59 -> M  (Early Morning + Morning)
+      12:00-14:59 -> A  (Noon)
+      15:00-18:59 -> E  (Evening)
+      19:00-03:59 -> N  (Night + Late Night)
+
+    Invalid/missing showtimes are ignored.
+    """
     if value is None:
         return None
     text = str(value).strip().upper()
-    hour: int | None = None
+    minute: int | None = None
+
     for fmt in ("%I:%M %p", "%H:%M", "%I %p"):
         try:
-            hour = dt.datetime.strptime(text, fmt).hour
+            parsed = dt.datetime.strptime(text, fmt)
+            minute = parsed.hour * 60 + parsed.minute
             break
         except ValueError:
             pass
-    if hour is None:
+
+    if minute is None:
         return None
-    if 5 <= hour < 12:
+
+    if 4 * 60 <= minute < 12 * 60:
         return "M"
-    if 12 <= hour < 17:
+    if 12 * 60 <= minute < 15 * 60:
         return "A"
-    if 17 <= hour < 21:
+    if 15 * 60 <= minute < 19 * 60:
         return "E"
     return "N"
 
@@ -220,6 +233,7 @@ class State:
         self.created = now_iso()
         self.last_run = self.created
         self.days: dict[str, dict[str, bool]] = {}
+        self.dirty: set[str] = set()
 
     def load(self) -> None:
         if not self.path.exists():
@@ -233,9 +247,11 @@ class State:
             self.created = data.get("created", self.created)
             self.last_run = data.get("last_run", self.last_run)
             self.days = data.get("days", {}) or {}
+            self.dirty = set(data.get("dirty", []) or [])
         except Exception as e:
             log.warning("Could not load state (%s); starting fresh", e)
             self.days = {}
+            self.dirty = set()
 
     def save(self) -> None:
         self.last_run = now_iso()
@@ -247,6 +263,7 @@ class State:
                 "created": self.created,
                 "last_run": self.last_run,
                 "days": self.days,
+                "dirty": sorted(self.dirty),
             }, f, indent=1, sort_keys=True)
         os.replace(tmp, self.path)
 
@@ -271,6 +288,15 @@ class State:
                 del self.days[k]
                 removed += 1
         return removed
+
+
+    def mark_dirty(self, movies: set[str]) -> None:
+        if movies:
+            self.dirty.update(movies)
+
+    def clear_dirty(self, movies: set[str]) -> None:
+        if movies:
+            self.dirty.difference_update(movies)
 
 
 # ============================================================
@@ -302,34 +328,59 @@ def is_historical_complete(state: State, today: dt.date) -> bool:
 # ============================================================
 
 def source_url(d: dt.date, mode: str) -> str | None:
+    """
+    Canonical source map based on the two supplied JS readers.
+
+    DAILY:
+      <= 2025-12-31 : finalsummary archive
+      2026-01       : finalsummary archive
+      2026-02 onward:
+          recent (yesterday/today) -> live finaldetailed
+          older             -> yearly archive finaldetailed
+
+    ADVANCE:
+      <= 2025-12-31 : not available
+      2026-01       : finaldetailed archive
+      2026-02 onward:
+          recent/future -> live finaldetailed
+          older         -> yearly archive finaldetailed
+    """
     today = today_ist()
 
-    if d.year <= 2025:
-        if mode != "daily":
-            return None
+    # No advance archive exists for <= 2025 in the supplied routing model.
+    if mode == "advance" and d.year <= 2025:
+        return None
+
+    # 2025 and earlier: daily is summary format.
+    if mode == "daily" and d.year <= 2025:
         return (
             "https://bfilmyapi2025.pages.dev/"
             f"daily/data/{d.year}/{d:%m-%d}_finalsummary.json"
         )
 
-    if d.year == 2026 and d.month == 1:
+    # January 2026 is the special archive:
+    # daily = finalsummary, advance = finaldetailed.
+    if d == dt.date(2026, 1, 1) or (d.year == 2026 and d.month == 1):
         if mode == "daily":
             return (
                 "https://bfilmyapi2026.pages.dev/"
                 f"daily/data/2026/{d:%m-%d}_finalsummary.json"
             )
-        if mode == "advance":
-            return (
-                "https://bfilmyapi2026.pages.dev/"
-                f"advance/data/2026/{d:%m-%d}_finalsummary.json"
-            )
+        return (
+            "https://bfilmyapi2026.pages.dev/"
+            f"advance/data/2026/{d:%m-%d}_finaldetailed.json"
+        )
 
-    if d >= today - dt.timedelta(days=1):
+    # The supplied detailed reader keeps the live endpoint for dates
+    # within the recent 30-day window and switches to the yearly archive
+    # only once the date is more than one month old.
+    if (today - d).days <= 30:
         return (
             "https://bfilmyapi.pages.dev/"
             f"{mode}/data/{d:%Y%m%d}/finaldetailed.json"
         )
 
+    # Historical 2026 archive uses year/MM-DD_finaldetailed.
     return (
         "https://bfilmyapi2026.pages.dev/"
         f"{mode}/data/2026/{d:%m-%d}_finaldetailed.json"
@@ -342,14 +393,22 @@ def source_url(d: dt.date, mode: str) -> str | None:
 
 def to_float(v: Any) -> float:
     try:
-        return 0.0 if v in (None, "") else float(v)
+        if v in (None, ""):
+            return 0.0
+        if isinstance(v, str):
+            v = v.replace(",", "").strip()
+        return float(v)
     except Exception:
         return 0.0
 
 
 def to_int(v: Any) -> int:
     try:
-        return 0 if v in (None, "") else int(float(v))
+        if v in (None, ""):
+            return 0
+        if isinstance(v, str):
+            v = v.replace(",", "").strip()
+        return int(float(v))
     except Exception:
         return 0
 
@@ -392,44 +451,25 @@ def parse_movie_variant(raw: str) -> tuple[str, str, str]:
 # ============================================================
 # FF / HF
 # ============================================================
+# IMPORTANT: FinalDetialedJson.js does NOT use the raw "s" field or
+# arbitrary status strings for FF/HF. It computes them only from:
+#
+#   occ = sold / totalSeats * 100
+#   HF if occ >= 98
+#   FF if 50 <= occ < 98
+#
+# Keep this identical for detailed input.
+# ============================================================
 
-def explicit_flag(row: dict, flag: str) -> bool:
-    if flag == "ff":
-        keys = ("ff", "fastfilling", "fast_filling", "fastFilling", "fast-filling")
-        status = {"ff", "fastfilling", "fast filling", "fast-filling"}
-    else:
-        keys = ("hf", "housefull", "house_full", "houseFull", "house-full")
-        status = {"hf", "housefull", "house full", "house-full"}
-
-    for k in keys:
-        if k not in row:
-            continue
-        v = row[k]
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, (int, float)):
-            return v > 0
-        if str(v).strip().lower() in status:
-            return True
-
-    for k in ("status", "booking_status", "bookingStatus", "booking"):
-        if k in row and str(row[k]).strip().lower() in status:
-            return True
-    return False
-
-
-def get_ff(row: dict) -> int:
-    return int(explicit_flag(row, "ff"))
-
-
-def get_hf(row: dict, sold: int, seats: int) -> int:
-    if explicit_flag(row, "hf"):
-        return 1
-    available = row.get("available")
-    if seats > 0 and available is not None and to_int(available) == 0 and sold >= seats:
-        return 1
-    return 0
-
+def get_ff_hf(sold: int, seats: int) -> tuple[int, int]:
+    if seats <= 0:
+        return 0, 0
+    occ = sold / seats * 100.0
+    if occ >= 98.0:
+        return 0, 1
+    if occ >= 50.0:
+        return 1, 0
+    return 0, 0
 
 # ============================================================
 # COMPACT METRIC
@@ -602,38 +642,75 @@ def add_metric(t, g, ti, sh, ff, hf, se, z) -> None:
 # ============================================================
 
 def _iter_detailed(path: str) -> Iterator[dict]:
+    """Streaming iterator for {data:[...]} finaldetailed.json."""
     if ijson is not None:
         with open(path, "rb") as f:
             yield from ijson.items(f, "data.item")
         return
+
     with open(path, "r", encoding="utf-8") as f:
-        for row in json.load(f).get("data", []):
-            yield row
+        payload = json.load(f)
+    for row in payload.get("data", []) or []:
+        yield row
 
 
 def _iter_summary(path: str) -> Iterator[tuple[str, dict]]:
+    """Streaming iterator for {movies:{...}} finalsummary.json."""
     if ijson is not None:
         with open(path, "rb") as f:
             yield from ijson.kvitems(f, "movies")
         return
+
     with open(path, "r", encoding="utf-8") as f:
-        for k, v in json.load(f).get("movies", {}).items():
-            yield k, v
+        payload = json.load(f)
+    for key, value in (payload.get("movies", {}) or {}).items():
+        yield key, value
+
+
+def _city_entity(city: str, state: str) -> str:
+    """
+    Use city||state internally so duplicate city names from different
+    states never collapse in SQLite. The public JSON writer decodes it.
+    """
+    return f"{city}||{state}" if state else city
+
+
+def _split_city_entity(entity: str, state: str = "") -> tuple[str, str]:
+    if "||" in entity:
+        city, embedded_state = entity.split("||", 1)
+        return city, embedded_state or state
+    return entity, state
 
 
 def parse_detailed_sync(path: str, date: dt.date) -> tuple[list, list]:
+    """
+    Parse finaldetailed.json exactly at show/session level.
+
+    Every raw show contributes:
+      - movie/format/language daily metric
+      - city+state metric
+      - chain metric
+      - M/A/E/N timewise metric
+
+    No venue/audi/session_id/available/etc. are retained because the
+    target compact movie JSON does not consume those fields.
+    """
     date_str = date.isoformat()
-    include_timewise = date >= dt.date(2026, 2, 1)
-    buckets: dict[tuple, dict] = {}
+    buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     for row in _iter_detailed(path):
         if not isinstance(row, dict):
             continue
+
         raw_movie = row.get("movie")
         if not raw_movie:
             continue
 
-        movie, fmt, lang = parse_movie_variant(raw_movie)
+        movie, fmt, lang = parse_movie_variant(str(raw_movie))
+        # Match FinalDetailed client: invalid movie variant strings are ignored.
+        if not movie or not fmt or not lang:
+            continue
+
         key = (movie, fmt, lang)
         bucket = buckets.get(key)
         if bucket is None:
@@ -641,67 +718,94 @@ def parse_detailed_sync(path: str, date: dt.date) -> tuple[list, list]:
                 "daily": metric_zero(),
                 "cities": {},
                 "chains": {},
-                "times": {s: metric_zero() for s in "MAEN"},
+                "times": {slot: metric_zero() for slot in "MAEN"},
             }
             buckets[key] = bucket
 
         gross = to_float(row.get("gross"))
         tickets = to_int(row.get("sold"))
         seats = to_int(row.get("totalSeats"))
-        ff = get_ff(row)
-        hf = get_hf(row, tickets, seats)
-        zero = int(gross == 0)
+        ff, hf = get_ff_hf(tickets, seats)
 
-        add_metric(bucket["daily"], gross, tickets, 1, ff, hf, seats, zero)
+        # Keep z because it is already part of the declared compact schema.
+        zero_gross = int(gross == 0)
+        add_metric(bucket["daily"], gross, tickets, 1, ff, hf, seats, zero_gross)
 
         city = str(row.get("city") or "").strip()
         state = str(row.get("state") or "").strip()
         if city:
-            cd = bucket["cities"].get(city)
-            if cd is None:
-                cd = {"state": state, "metric": metric_zero()}
-                bucket["cities"][city] = cd
-            elif not cd["state"] and state:
-                cd["state"] = state
-            add_metric(cd["metric"], gross, tickets, 1, ff, hf, seats, zero)
+            entity = _city_entity(city, state)
+            city_rec = bucket["cities"].get(entity)
+            if city_rec is None:
+                city_rec = {"state": state, "metric": metric_zero()}
+                bucket["cities"][entity] = city_rec
+            add_metric(
+                city_rec["metric"],
+                gross, tickets, 1, ff, hf, seats, zero_gross
+            )
 
         chain = str(row.get("chain") or "").strip()
         if chain:
-            ch = bucket["chains"].get(chain)
-            if ch is None:
-                ch = metric_zero()
-                bucket["chains"][chain] = ch
-            add_metric(ch, gross, tickets, 1, ff, hf, seats, zero)
+            chain_rec = bucket["chains"].get(chain)
+            if chain_rec is None:
+                chain_rec = metric_zero()
+                bucket["chains"][chain] = chain_rec
+            add_metric(
+                chain_rec,
+                gross, tickets, 1, ff, hf, seats, zero_gross
+            )
 
-        if include_timewise:
-            slot = get_time_slot(row.get("time"))
-            if slot:
-                add_metric(bucket["times"][slot], gross, tickets, 1, ff, hf, seats, zero)
+        slot = get_time_slot(row.get("time"))
+        if slot:
+            add_metric(
+                bucket["times"][slot],
+                gross, tickets, 1, ff, hf, seats, zero_gross
+            )
 
     rows: list[tuple] = []
     variants: list[tuple[str, str, str]] = []
 
-    for (movie, fmt, lang), b in buckets.items():
+    for (movie, fmt, lang), bucket in buckets.items():
         variants.append((movie, fmt, lang))
 
-        rows.append(("__MODE__", "d", date_str, movie, fmt, lang, "", "", *b["daily"]))
-        for city, cd in b["cities"].items():
-            rows.append(("__MODE__", "c", date_str, movie, fmt, lang,
-                         city, cd["state"], *cd["metric"]))
-        for chain, vals in b["chains"].items():
-            rows.append(("__MODE__", "ch", date_str, movie, fmt, lang,
-                         chain, "", *vals))
-        if include_timewise:
-            for slot in "MAEN":
-                vals = b["times"][slot]
-                if vals[2]:
-                    rows.append(("__MODE__", "tm", date_str, movie, fmt, lang,
-                                 slot, "", *vals))
+        rows.append((
+            "__MODE__", "d", date_str, movie, fmt, lang, "", "",
+            *bucket["daily"]
+        ))
+
+        for city_entity, city_rec in bucket["cities"].items():
+            rows.append((
+                "__MODE__", "c", date_str, movie, fmt, lang,
+                city_entity, city_rec["state"], *city_rec["metric"]
+            ))
+
+        for chain, values in bucket["chains"].items():
+            rows.append((
+                "__MODE__", "ch", date_str, movie, fmt, lang,
+                chain, "", *values
+            ))
+
+        for slot in "MAEN":
+            values = bucket["times"][slot]
+            if values[2]:  # shows
+                rows.append((
+                    "__MODE__", "tm", date_str, movie, fmt, lang,
+                    slot, "", *values
+                ))
 
     return rows, variants
 
 
-def parse_summary_sync(path: str, date: dt.date) -> tuple[list, list]:
+def parse_summary_sync(path: str, date: dt.date, mode: str = "daily") -> tuple[list, list]:
+    """
+    Parse finalsummary.json exactly as the supplied FinalSummary reader expects:
+      root.movies[rawMovie] -> movie-level aggregate
+      details[]              -> city/state aggregate
+      Chain_details[]        -> chain aggregate
+
+    The source already contains FF/HF/shows/seats totals, so those are trusted
+    instead of being reconstructed from city rows.
+    """
     date_str = date.isoformat()
     rows: list[tuple] = []
     variants: list[tuple[str, str, str]] = []
@@ -709,28 +813,34 @@ def parse_summary_sync(path: str, date: dt.date) -> tuple[list, list]:
     for raw_movie, data in _iter_summary(path):
         if not isinstance(data, dict):
             continue
-        movie, fmt, lang = parse_movie_variant(raw_movie)
+
+        movie, fmt, lang = parse_movie_variant(str(raw_movie))
+        if not movie:
+            continue
+
         variants.append((movie, fmt, lang))
 
-        gross = to_float(data.get("gross"))
-        tickets = to_int(data.get("sold"))
-        shows = to_int(data.get("shows"))
-        seats = to_int(data.get("totalSeats"))
-        ff = to_int(data.get("fastfilling"))
-        hf = to_int(data.get("housefull"))
+        rows.append((
+            mode, "d", date_str, movie, fmt, lang, "", "",
+            to_float(data.get("gross")),
+            to_int(data.get("sold")),
+            to_int(data.get("shows")),
+            to_int(data.get("fastfilling")),
+            to_int(data.get("housefull")),
+            to_int(data.get("totalSeats")),
+            0,
+        ))
 
-        rows.append(("daily", "d", date_str, movie, fmt, lang, "", "",
-                     gross, tickets, shows, ff, hf, seats, 0))
-
-        for item in (data.get("details") or []):
+        for item in data.get("details") or []:
             if not isinstance(item, dict):
                 continue
             city = str(item.get("city") or "").strip()
             if not city:
                 continue
+            state = str(item.get("state") or "").strip()
             rows.append((
-                "daily", "c", date_str, movie, fmt, lang,
-                city, str(item.get("state") or ""),
+                mode, "c", date_str, movie, fmt, lang,
+                _city_entity(city, state), state,
                 to_float(item.get("gross")),
                 to_int(item.get("sold")),
                 to_int(item.get("shows")),
@@ -740,14 +850,14 @@ def parse_summary_sync(path: str, date: dt.date) -> tuple[list, list]:
                 0,
             ))
 
-        for item in (data.get("Chain_details") or []):
+        for item in data.get("Chain_details") or []:
             if not isinstance(item, dict):
                 continue
             chain = str(item.get("chain") or "").strip()
             if not chain:
                 continue
             rows.append((
-                "daily", "ch", date_str, movie, fmt, lang, chain, "",
+                mode, "ch", date_str, movie, fmt, lang, chain, "",
                 to_float(item.get("gross")),
                 to_int(item.get("sold")),
                 to_int(item.get("shows")),
@@ -761,14 +871,23 @@ def parse_summary_sync(path: str, date: dt.date) -> tuple[list, list]:
 
 
 def patch_mode(rows: list[tuple], mode: str) -> None:
-    for i, r in enumerate(rows):
-        if r[0] == "__MODE__":
-            rows[i] = (mode,) + r[1:]
+    """Replace the temporary __MODE__ marker with daily/advance."""
+    target = "daily" if mode == "daily" else "advance"
+    for i, row in enumerate(rows):
+        if row and row[0] == "__MODE__":
+            rows[i] = (target,) + row[1:]
 
 
 def parse_sync(path: str, date: dt.date, mode: str) -> tuple[list, list]:
+    """
+    Correct parser dispatch:
+      * 2025 and earlier daily -> finalsummary
+      * January 2026 daily      -> finalsummary
+      * everything else         -> finaldetailed
+    """
     if mode == "daily" and date <= dt.date(2026, 1, 31):
-        return parse_summary_sync(path, date)
+        return parse_summary_sync(path, date, mode=mode)
+
     rows, variants = parse_detailed_sync(path, date)
     patch_mode(rows, mode)
     return rows, variants
@@ -815,7 +934,7 @@ async def download_one(session, date, mode, url):
 # ============================================================
 
 class Stats:
-    __slots__ = ("ok", "miss", "fail", "done", "rows", "batches", "built_movies")
+    __slots__ = ("ok", "miss", "fail", "done", "rows", "batches", "affected_movies")
     def __init__(self):
         self.ok = 0
         self.miss = 0
@@ -823,7 +942,7 @@ class Stats:
         self.done = 0
         self.rows = 0
         self.batches = 0
-        self.built_movies: set[str] = set()
+        self.affected_movies: set[str] = set()
 
 
 # ============================================================
@@ -831,18 +950,17 @@ class Stats:
 # ============================================================
 
 async def db_writer_task(
-    queue, json_queue, conn, lock, loop,
-    state, state_lock, stats,
-    flush_every, flush_max_rows, json_rebuild_every,
+    queue, conn, lock, loop, state, state_lock, stats,
+    flush_every, flush_max_rows,
 ):
     pending: list = []
     pending_rows = 0
-    batches_since_rebuild = 0
 
     async def flush_db():
         nonlocal pending, pending_rows
         if not pending:
-            return None
+            return
+
         batch = pending
         pending = []
         pending_rows = 0
@@ -852,96 +970,47 @@ async def db_writer_task(
                 None, _write_batch_sync, conn, lock, batch,
             )
         except Exception as e:
-            log.warning("DB write failed (%d days): %s: %s",
-                        len(batch), type(e).__name__, e)
+            log.warning(
+                "DB write failed (%d jobs): %s: %s",
+                len(batch), type(e).__name__, e,
+            )
             for _ in batch:
                 queue.task_done()
-            return None
-
-        async with state_lock:
-            state.mark_many([(d, m) for d, m, _, _ in batch])
-            state.save()
-
-        stats.batches += 1
+            return
 
         affected: set[str] = set()
         for _, _, _, variants in batch:
-            for v in variants:
-                affected.add(v[0])
+            for movie, _, _ in variants:
+                affected.add(movie)
 
-        with lock:
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("PRAGMA shrink_memory")
-        gc.collect()
+        async with state_lock:
+            state.mark_many([(d, m) for d, m, _, _ in batch])
+            state.mark_dirty(affected)
+            state.save()
 
-        log.debug("writer flushed batch #%d days=%d rows=%d affected_movies=%d",
-                  stats.batches, len(batch), n, len(affected))
+        stats.batches += 1
+        stats.affected_movies.update(affected)
+
+        log.debug(
+            "writer batch #%d jobs=%d rows=%d affected_movies=%d",
+            stats.batches, len(batch), n, len(affected),
+        )
 
         for _ in batch:
             queue.task_done()
-        return affected
-
-    async def maybe_enqueue_json(movies, force=False):
-        nonlocal batches_since_rebuild
-        if not movies:
-            return
-        if not force and batches_since_rebuild < json_rebuild_every:
-            return
-        batches_since_rebuild = 0
-        for m in movies:
-            json_queue.put_nowait(m)
 
     while True:
         item = await queue.get()
-
         if item is None:
-            affected = await flush_db()
-            if affected:
-                await maybe_enqueue_json(affected, force=True)
-            json_queue.put_nowait(None)
+            await flush_db()
             queue.task_done()
             return
 
         pending.append(item)
         pending_rows += len(item[2])
 
-        if (len(pending) >= flush_every
-                or pending_rows >= flush_max_rows):
-            affected = await flush_db()
-            if affected:
-                batches_since_rebuild += 1
-                await maybe_enqueue_json(affected)
-
-
-# ============================================================
-# JSON REBUILD TASK
-# ============================================================
-
-def _rebuild_movie_sync(conn, lock, movie):
-    with lock:
-        return build_movie(conn, movie)
-
-
-async def json_rebuild_task(json_queue, conn, lock, loop, stats):
-    rebuilt = 0
-    while True:
-        movie = await json_queue.get()
-        if movie is None:
-            json_queue.task_done()
-            log.debug("JSON rebuild task done (%d movies)", rebuilt)
-            return
-        try:
-            result = await loop.run_in_executor(
-                None, _rebuild_movie_sync, conn, lock, movie,
-            )
-            if result is not None:
-                stats.built_movies.add(movie)
-                rebuilt += 1
-        except Exception as e:
-            log.warning("JSON rebuild failed for %s: %s: %s",
-                        movie, type(e).__name__, e)
-        finally:
-            json_queue.task_done()
+        if len(pending) >= flush_every or pending_rows >= flush_max_rows:
+            await flush_db()
 
 
 # ============================================================
@@ -950,26 +1019,28 @@ async def json_rebuild_task(json_queue, conn, lock, loop, stats):
 
 async def run_fetch_phase(session, conn, db_lock, plan, state, today):
     loop = asyncio.get_running_loop()
+
     parse_pool = concurrent.futures.ThreadPoolExecutor(
-        max_workers=PARSE_THREADS, thread_name_prefix="parse",
+        max_workers=PARSE_THREADS,
+        thread_name_prefix="parse",
     )
 
     db_queue: asyncio.Queue = asyncio.Queue(maxsize=DB_QUEUE_DEPTH)
-    json_queue: asyncio.Queue = asyncio.Queue()
-
     stats = Stats()
     state_lock = asyncio.Lock()
 
     writer = asyncio.create_task(
         db_writer_task(
-            db_queue, json_queue, conn, db_lock, loop,
-            state, state_lock, stats,
-            FLUSH_EVERY_N_FILES, FLUSH_MAX_ROWS,
-            JSON_REBUILD_EVERY_N_BATCHES,
+            db_queue,
+            conn,
+            db_lock,
+            loop,
+            state,
+            state_lock,
+            stats,
+            FLUSH_EVERY_N_FILES,
+            FLUSH_MAX_ROWS,
         )
-    )
-    json_task = asyncio.create_task(
-        json_rebuild_task(json_queue, conn, db_lock, loop, stats)
     )
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -977,23 +1048,22 @@ async def run_fetch_phase(session, conn, db_lock, plan, state, today):
     t0 = time.perf_counter()
     last_report = t0
 
-    async def report_throttled():
+    async def report_throttled(force=False):
         nonlocal last_report
         now = time.perf_counter()
-        if now - last_report >= 5.0:
-            elapsed = now - t0
-            rate = stats.done / elapsed if elapsed > 0 else 0.0
-            eta = (total - stats.done) / rate if rate > 0 else 0.0
-            log.info(
-                "  progress  ok=%d miss=%d fail=%d  %d/%d  "
-                "(%.1f/s, ETA %.0fs, dbq=%d/%d, jsonq=%d, "
-                "json_done=%d, rss=%.0fMB)",
-                stats.ok, stats.miss, stats.fail,
-                stats.done, total, rate, eta,
-                db_queue.qsize(), DB_QUEUE_DEPTH,
-                json_queue.qsize(), len(stats.built_movies), rss_mb(),
-            )
-            last_report = now
+        if not force and now - last_report < 5.0:
+            return
+        elapsed = now - t0
+        rate = stats.done / elapsed if elapsed > 0 else 0.0
+        eta = (total - stats.done) / rate if rate > 0 else 0.0
+        log.info(
+            "  progress ok=%d miss=%d fail=%d %d/%d "
+            "(%.1f jobs/s, ETA %.0fs, dbq=%d/%d, rss=%.0fMB)",
+            stats.ok, stats.miss, stats.fail,
+            stats.done, total, rate, eta,
+            db_queue.qsize(), DB_QUEUE_DEPTH, rss_mb(),
+        )
+        last_report = now
 
     async def worker(date, mode, url):
         async with sem:
@@ -1003,16 +1073,21 @@ async def run_fetch_phase(session, conn, db_lock, plan, state, today):
                 if not path:
                     stats.miss += 1
                     return
+
                 rows, variants = await loop.run_in_executor(
                     parse_pool, parse_sync, path, date, mode,
                 )
+
                 await db_queue.put((date, mode, rows, variants))
                 stats.ok += 1
                 stats.rows += len(rows)
+
             except Exception as e:
                 stats.fail += 1
-                log.debug("[fail] %s %s: %s: %s",
-                          date, mode, type(e).__name__, e)
+                log.debug(
+                    "[fail] %s %s: %s: %s",
+                    date, mode, type(e).__name__, e,
+                )
             finally:
                 if path:
                     with contextlib.suppress(OSError):
@@ -1027,18 +1102,16 @@ async def run_fetch_phase(session, conn, db_lock, plan, state, today):
         await db_queue.join()
         await db_queue.put(None)
         await writer
-        await json_queue.join()
-        await json_task
         parse_pool.shutdown(wait=True)
         async with state_lock:
             state.save()
+        await report_throttled(force=True)
 
     log.info(
-        "Fetch phase complete: ok=%d miss=%d fail=%d rows=%d batches=%d "
-        "json_built=%d in %.1fs  rss=%.0fMB",
+        "Fetch complete: ok=%d miss=%d fail=%d rows=%d batches=%d "
+        "affected_movies=%d in %.1fs rss=%.0fMB",
         stats.ok, stats.miss, stats.fail, stats.rows, stats.batches,
-        len(stats.built_movies),
-        time.perf_counter() - t0, rss_mb(),
+        len(stats.affected_movies), time.perf_counter() - t0, rss_mb(),
     )
     return stats
 
@@ -1054,295 +1127,292 @@ def jdump(o: Any) -> str:
     return json.dumps(o, **_J)
 
 
-def _has_rows(conn, movie, fmt, lang, mode, dim) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM metrics WHERE movie=? AND format=? AND language=? "
-        "AND mode=? AND dim=? LIMIT 1",
-        (movie, fmt, lang, mode, dim),
-    ).fetchone() is not None
-
-
-def _write_daily_map(f, conn, movie, fmt, lang, mode) -> None:
-    cur = conn.execute(
-        "SELECT date, gross, tickets, shows, ff, hf, seats, zero_gross "
-        "FROM metrics WHERE movie=? AND format=? AND language=? AND mode=? "
-        "AND dim='d' ORDER BY date",
-        (movie, fmt, lang, mode),
-    )
-    first = True
-    for date, g, t, sh, ff, hf, se, z in cur:
-        if not first:
-            f.write(",")
-        first = False
-        f.write(jdump(date))
-        f.write(":")
-        write_metric(f, (g, t, sh, ff, hf, se, z))
-
-
-def _write_citywise(f, conn, movie, fmt, lang, mode) -> None:
-    cur = conn.execute(
-        "SELECT entity, state, date, gross, tickets, shows, ff, hf, seats, "
-        "zero_gross FROM metrics WHERE movie=? AND format=? AND language=? "
-        "AND mode=? AND dim='c' ORDER BY entity, date",
-        (movie, fmt, lang, mode),
-    )
-    cur_city = None
-    dfirst = True
-    cfirst = True
-    for city, state, date, g, t, sh, ff, hf, se, z in cur:
-        if city != cur_city:
-            if cur_city is not None:
-                f.write("}}")
-            if not cfirst:
-                f.write(",")
-            cfirst = False
-            f.write(jdump(city))
-            f.write(":{")
-            if state:
-                f.write('"s":')
-                f.write(jdump(state))
-                f.write(",")
-            f.write('"d":{')
-            cur_city = city
-            dfirst = True
-        if not dfirst:
-            f.write(",")
-        dfirst = False
-        f.write(jdump(date))
-        f.write(":")
-        write_metric(f, (g, t, sh, ff, hf, se, z))
-    if cur_city is not None:
-        f.write("}}")
-
-
-def _write_chainwise(f, conn, movie, fmt, lang, mode) -> None:
-    cur = conn.execute(
-        "SELECT entity, date, gross, tickets, shows, ff, hf, seats, "
-        "zero_gross FROM metrics WHERE movie=? AND format=? AND language=? "
-        "AND mode=? AND dim='ch' ORDER BY entity, date",
-        (movie, fmt, lang, mode),
-    )
-    cur_ch = None
-    dfirst = True
-    cfirst = True
-    for ch, date, g, t, sh, ff, hf, se, z in cur:
-        if ch != cur_ch:
-            if cur_ch is not None:
-                f.write("}")
-            if not cfirst:
-                f.write(",")
-            cfirst = False
-            f.write(jdump(ch))
-            f.write(":{")
-            cur_ch = ch
-            dfirst = True
-        if not dfirst:
-            f.write(",")
-        dfirst = False
-        f.write(jdump(date))
-        f.write(":")
-        write_metric(f, (g, t, sh, ff, hf, se, z))
-    if cur_ch is not None:
-        f.write("}")
-
-
-def _write_timewise(f, conn, movie, fmt, lang, mode) -> None:
-    present = [r[0] for r in conn.execute(
-        "SELECT DISTINCT entity FROM metrics WHERE movie=? AND format=? "
-        "AND language=? AND mode=? AND dim='tm'",
-        (movie, fmt, lang, mode),
-    )]
-    ordered = [s for s in "MAEN" if s in present]
-    if not ordered:
-        return
-    sfirst = True
-    for slot in ordered:
-        if not sfirst:
-            f.write(",")
-        sfirst = False
-        f.write(jdump(slot))
-        f.write(":{")
-        cur = conn.execute(
-            "SELECT date, gross, tickets, shows, ff, hf, seats, zero_gross "
-            "FROM metrics WHERE movie=? AND format=? AND language=? "
-            "AND mode=? AND dim='tm' AND entity=? ORDER BY date",
-            (movie, fmt, lang, mode, slot),
-        )
-        dfirst = True
-        for date, g, t, sh, ff, hf, se, z in cur:
-            if not dfirst:
-                f.write(",")
-            dfirst = False
-            f.write(jdump(date))
-            f.write(":")
-            f.write(jdump(compact_timewise(g, t, sh, ff, hf, se)))
-        f.write("}")
-
-
-def _write_mode_block(f, conn, movie, fmt, lang, mode) -> None:
-    first = True
-    for dim, key, writer in (
-        ("d", "daily", _write_daily_map),
-        ("c", "citywise", _write_citywise),
-        ("ch", "chainwise", _write_chainwise),
-        ("tm", "timewise", _write_timewise),
-    ):
-        if not _has_rows(conn, movie, fmt, lang, mode, dim):
-            continue
-        if not first:
-            f.write(",")
-        first = False
-        f.write(jdump(key))
-        f.write(":{")
-        writer(f, conn, movie, fmt, lang, mode)
-        f.write("}")
-
-
-def _totals_for_mode(conn, movie, fmt, lang, mode):
-    row = conn.execute(
-        "SELECT COALESCE(SUM(gross),0), COALESCE(SUM(tickets),0), "
-        "COALESCE(SUM(shows),0), COALESCE(SUM(ff),0), COALESCE(SUM(hf),0), "
-        "COALESCE(SUM(seats),0), COALESCE(SUM(zero_gross),0) FROM metrics "
-        "WHERE movie=? AND format=? AND language=? AND mode=? AND dim='d'",
-        (movie, fmt, lang, mode),
-    ).fetchone()
-    return row if row and row[2] else None
-
-
-def _write_version(f, conn, movie, fmt, lang, summary_acc) -> None:
-    f.write("{")
-    parts = []
-    if fmt:
-        parts.append(('"format":', jdump(fmt)))
-    if lang:
-        parts.append(('"language":', jdump(lang)))
-    for i, (k, v) in enumerate(parts):
-        if i:
-            f.write(",")
-        f.write(k)
-        f.write(v)
-
-    for mode, root_name in (("daily", "boxoffice"), ("advance", "advance")):
-        exists = conn.execute(
-            "SELECT 1 FROM metrics WHERE movie=? AND format=? AND language=? "
-            "AND mode=? LIMIT 1",
-            (movie, fmt, lang, mode),
-        ).fetchone()
-        if not exists:
-            continue
+def _write_comma_key(f, key: str, value_text: str, first: bool) -> bool:
+    if not first:
         f.write(",")
-        f.write(jdump(root_name))
-        f.write(":{")
-        _write_mode_block(f, conn, movie, fmt, lang, mode)
-        f.write("}")
-
-    totals_raw: dict[str, tuple] = {}
-    for mode, root_name in (("daily", "boxoffice"), ("advance", "advance")):
-        obj = _totals_for_mode(conn, movie, fmt, lang, mode)
-        if obj:
-            totals_raw[root_name] = obj
-
-    if totals_raw:
-        f.write(',"totals":{')
-        first = True
-        for k, v in totals_raw.items():
-            if not first:
-                f.write(",")
-            first = False
-            f.write(jdump(k))
-            f.write(":")
-            f.write(jdump(compact_metric(v)))
-        f.write("}")
-
-        box = totals_raw.get("boxoffice")
-        if box:
-            g, t, sh, ff, hf, se, z = box
-            for bucket_key, target in ((fmt, "f"), (lang, "l")):
-                if not bucket_key:
-                    continue
-                acc = summary_acc[target]
-                if bucket_key not in acc:
-                    acc[bucket_key] = metric_zero()
-                add_metric(acc[bucket_key], g, t, sh, ff, hf, se, z)
-
-    f.write("}")
+    f.write(jdump(key))
+    f.write(":")
+    f.write(value_text)
+    return False
 
 
-def build_movie(conn, movie: str) -> Path | None:
-    """Atomic write: fill <slug>.json.tmp, then os.replace to <slug>.json."""
+def _rows_for_movie(conn: sqlite3.Connection, movie: str) -> tuple[list[tuple], list[tuple[str, str, str]]]:
+    """
+    One SELECT for the complete movie history. This replaces the previous
+    dozens of per-dimension/per-variant SQL queries.
+    """
     variants = conn.execute(
-        "SELECT format, language FROM variants WHERE movie=? "
-        "ORDER BY format, language", (movie,),
+        "SELECT format, language FROM variants WHERE movie=? ORDER BY format, language",
+        (movie,),
     ).fetchall()
+
+    rows = conn.execute(
+        """
+        SELECT mode, dim, date, format, language, entity, state,
+               gross, tickets, shows, ff, hf, seats, zero_gross
+        FROM metrics
+        WHERE movie=?
+        ORDER BY mode, dim, format, language, entity, date
+        """,
+        (movie,),
+    ).fetchall()
+
+    variant_list = [(movie, f, l) for f, l in variants]
+    return rows, variant_list
+
+
+def build_movie(conn: sqlite3.Connection, movie: str) -> Path | None:
+    """
+    High-throughput movie build.
+
+    Reads all metrics for this movie in ONE SQL query, materializes compact
+    JSON in memory, then performs one atomic file replace.
+    """
+    raw_rows, variants = _rows_for_movie(conn, movie)
     if not variants:
         return None
 
-    row = conn.execute(
-        "SELECT MIN(date), MAX(date) FROM metrics "
-        "WHERE movie=? AND mode='daily' AND dim='d'", (movie,),
-    ).fetchone()
-    if not row or not row[0]:
+    # A movie may be advance-only (unreleased). Do not discard it merely
+    # because it has no daily history yet.
+    all_dates = [
+        r[2] for r in raw_rows
+        if r[1] == "d"
+    ]
+    if not all_dates:
         return None
-    startdate, lastdate = row
 
-    formats = sorted({f for f, _ in variants if f})
-    languages = sorted({l for _, l in variants if l})
+    startdate = min(all_dates)
+    lastdate = max(all_dates)
+
+    formats = sorted({f for _, f, _ in variants if f})
+    languages = sorted({l for _, _, l in variants if l})
     slug = slugify(movie)
     if not slug:
         return None
 
+    # variant_data[(fmt,lang)] = {mode: {dim: ...}}
+    variant_data: dict[tuple[str, str], dict[str, dict[str, Any]]] = {
+        (fmt, lang): {
+            "daily": {"d": {}, "c": {}, "ch": {}, "tm": {}},
+            "advance": {"d": {}, "c": {}, "ch": {}, "tm": {}},
+        }
+        for _, fmt, lang in variants
+    }
+
+    # Aggregate output for compact summary.
+    summary_f: dict[str, list] = {}
+    summary_l: dict[str, list] = {}
+
+    for (
+        mode, dim, date, fmt, lang, entity, state,
+        gross, tickets, shows, ff, hf, seats, zero_gross
+    ) in raw_rows:
+        bucket = variant_data.get((fmt, lang))
+        if bucket is None:
+            bucket = {
+                "daily": {"d": {}, "c": {}, "ch": {}, "tm": {}},
+                "advance": {"d": {}, "c": {}, "ch": {}, "tm": {}},
+            }
+            variant_data[(fmt, lang)] = bucket
+
+        metric = (
+            gross, tickets, shows, ff, hf, seats, zero_gross
+        )
+
+        if dim == "d":
+            bucket[mode]["d"][date] = metric
+        elif dim == "c":
+            city, state2 = _split_city_entity(entity, state)
+            # Preserve exact city output when unique; collision handling is
+            # deterministic and lossless.
+            bucket[mode]["c"].setdefault(
+                city, {}
+            ).setdefault(state2 or "", {})[date] = metric
+        elif dim == "ch":
+            bucket[mode]["ch"].setdefault(entity, {})[date] = metric
+        elif dim == "tm":
+            bucket[mode]["tm"].setdefault(entity, {})[date] = metric
+
+    def add_summary(target: dict[str, list], key: str, metric: tuple) -> None:
+        acc = target.get(key)
+        if acc is None:
+            acc = metric_zero()
+            target[key] = acc
+        add_metric(acc, *metric)
+
+    # Build formatwise/languagewise from daily totals only.
+    # This intentionally uses the already aggregated day rows rather than
+    # summing city rows, preventing geographic duplication.
+    for (fmt, lang), data in variant_data.items():
+        for metric in data["daily"]["d"].values():
+            add_summary(summary_f, fmt, metric) if fmt else None
+            add_summary(summary_l, lang, metric) if lang else None
+
+    def compact_metric_from_tuple(metric: tuple) -> list:
+        return compact_metric(metric)
+
+    def render_citywise(mode_data: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for city in sorted(mode_data["c"]):
+            states = mode_data["c"][city]
+            # Normal case: one state for this city.
+            if len(states) == 1:
+                state_name, dates = next(iter(states.items()))
+                obj: dict[str, Any] = {}
+                if state_name:
+                    obj["s"] = state_name
+                obj["d"] = {
+                    date: compact_metric_from_tuple(metric)
+                    for date, metric in sorted(dates.items())
+                }
+                out[city] = obj
+            else:
+                # Rare collision-safe representation:
+                # key is city|state, while preserving the same s/d contract.
+                for state_name in sorted(states):
+                    dates = states[state_name]
+                    key = f"{city}|{state_name}" if state_name else city
+                    obj = {}
+                    if state_name:
+                        obj["s"] = state_name
+                    obj["d"] = {
+                        date: compact_metric_from_tuple(metric)
+                        for date, metric in sorted(dates.items())
+                    }
+                    out[key] = obj
+        return out
+
+    def render_chainwise(mode_data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            chain: {
+                date: compact_metric_from_tuple(metric)
+                for date, metric in sorted(dates.items())
+            }
+            for chain, dates in sorted(mode_data["ch"].items())
+        }
+
+    def render_timewise(mode_data: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for slot in "MAEN":
+            if slot in mode_data["tm"]:
+                dates = mode_data["tm"][slot]
+                out[slot] = {
+                    date: compact_timewise(*metric[:6])
+                    for date, metric in sorted(dates.items())
+                }
+        return out
+
+    def render_mode(mode_data: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+
+        if mode_data["d"]:
+            out["daily"] = {
+                date: compact_metric_from_tuple(metric)
+                for date, metric in sorted(mode_data["d"].items())
+            }
+
+        if mode_data["c"]:
+            out["citywise"] = render_citywise(mode_data)
+
+        if mode_data["ch"]:
+            out["chainwise"] = render_chainwise(mode_data)
+
+        if mode_data["tm"]:
+            out["timewise"] = render_timewise(mode_data)
+
+        return out
+
+    # Global totals per mode from daily rows only.
+    totals_raw: dict[str, list] = {}
+    for mode, root in (("daily", "boxoffice"), ("advance", "advance")):
+        total = metric_zero()
+        found = False
+        for (fmt, lang), data in variant_data.items():
+            for metric in data[mode]["d"].values():
+                add_metric(total, *metric)
+                found = True
+        if found:
+            totals_raw[root] = compact_metric(total)
+
+    versions = []
+    for _, fmt, lang in variants:
+        data = variant_data[(fmt, lang)]
+        version: dict[str, Any] = {}
+        if fmt:
+            version["format"] = fmt
+        if lang:
+            version["language"] = lang
+
+        if data["daily"]:
+            block = render_mode(data["daily"])
+            if block:
+                version["boxoffice"] = block
+
+        if data["advance"]["d"] or data["advance"]["c"] or data["advance"]["ch"] or data["advance"]["tm"]:
+            block = render_mode(data["advance"])
+            if block:
+                version["advance"] = block
+
+        # Per-variant totals, not global totals.
+        var_totals: dict[str, list] = {}
+        for mode, root in (("daily", "boxoffice"), ("advance", "advance")):
+            acc = metric_zero()
+            found = False
+            for metric in data[mode]["d"].values():
+                add_metric(acc, *metric)
+                found = True
+            if found:
+                var_totals[root] = compact_metric(acc)
+        if var_totals:
+            version["totals"] = var_totals
+
+        versions.append(version)
+
+    payload: dict[str, Any] = {
+        "movie": movie,
+        "slug": slug,
+        "formats": formats,
+        "languages": languages,
+        "startdate": startdate,
+        "lastdate": lastdate,
+        "versions": versions,
+    }
+
+    # Keep the original compact summary contract.
+    if summary_f or summary_l:
+        payload["summary"] = {}
+        if summary_f:
+            payload["summary"]["formatwise"] = {
+                key: compact_metric(val)
+                for key, val in sorted(summary_f.items())
+            }
+        if summary_l:
+            payload["summary"]["languagewise"] = {
+                key: compact_metric(val)
+                for key, val in sorted(summary_l.items())
+            }
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUTPUT_DIR / f"{slug}.json"
-    tmp = OUTPUT_DIR / f"{slug}.json.tmp"
-    summary_acc = {"f": {}, "l": {}}
+    tmp = OUTPUT_DIR / f"{slug}.json.tmp.{os.getpid()}.{threading.get_ident()}"
 
     try:
         with tmp.open("w", encoding="utf-8", newline="\n",
                       buffering=FILE_WRITE_BUFFER) as f:
-            f.write("{")
-            f.write('"movie":');     f.write(jdump(movie))
-            f.write(',"slug":');     f.write(jdump(slug))
-            f.write(',"formats":');  f.write(jdump(formats))
-            f.write(',"languages":');f.write(jdump(languages))
-            f.write(',"startdate":');f.write(jdump(startdate))
-            f.write(',"lastdate":'); f.write(jdump(lastdate))
-            f.write(',"versions":[')
-            first = True
-            for fmt, lang in variants:
-                if not first:
-                    f.write(",")
-                first = False
-                _write_version(f, conn, movie, fmt, lang, summary_acc)
-            f.write("]")
-            if summary_acc["f"] or summary_acc["l"]:
-                f.write(',"summary":{')
-                f.write('"formatwise":{')
-                first = True
-                for k, v in summary_acc["f"].items():
-                    if not first:
-                        f.write(",")
-                    first = False
-                    f.write(jdump(k))
-                    f.write(":")
-                    f.write(jdump(compact_metric(v)))
-                f.write("}")
-                f.write(',"languagewise":{')
-                first = True
-                for k, v in summary_acc["l"].items():
-                    if not first:
-                        f.write(",")
-                    first = False
-                    f.write(jdump(k))
-                    f.write(":")
-                    f.write(jdump(compact_metric(v)))
-                f.write("}")
-                f.write("}")
-            f.write("}")
+            json.dump(
+                payload,
+                f,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, out)
     except BaseException:
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
         raise
+
     return out
 
 
@@ -1367,7 +1437,7 @@ def generate_jobs(state: State, today: dt.date, force_full: bool):
         jobs: list[tuple[dt.date, str, str]] = []
 
         # Recent past — daily only
-        for i in range(INCREMENTAL_PAST_DAYS, -1, -1):
+        for i in range(INCREMENTAL_PAST_DAYS, 0, -1):
             d = today - dt.timedelta(days=i)
             u = source_url(d, "daily")
             if u:
@@ -1475,8 +1545,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--parse-workers", type=int, default=PARSE_THREADS)
     p.add_argument("--flush-files", type=int, default=FLUSH_EVERY_N_FILES)
     p.add_argument("--flush-rows", type=int, default=FLUSH_MAX_ROWS)
-    p.add_argument("--json-every", type=int,
-                   default=JSON_REBUILD_EVERY_N_BATCHES)
     p.add_argument("--queue-depth", type=int, default=DB_QUEUE_DEPTH)
     p.add_argument("--low-memory", action="store_true",
                    help="Ultra-low-memory preset (Replit free tier).")
@@ -1490,7 +1558,7 @@ def parse_args() -> argparse.Namespace:
 
 async def amain(args: argparse.Namespace) -> None:
     global MAX_CONCURRENCY, PARSE_THREADS, DB_QUEUE_DEPTH
-    global FLUSH_EVERY_N_FILES, FLUSH_MAX_ROWS, JSON_REBUILD_EVERY_N_BATCHES
+    global FLUSH_EVERY_N_FILES, FLUSH_MAX_ROWS
 
     if args.low_memory:
         MAX_CONCURRENCY = 6
@@ -1498,14 +1566,12 @@ async def amain(args: argparse.Namespace) -> None:
         DB_QUEUE_DEPTH = 3
         FLUSH_EVERY_N_FILES = 10
         FLUSH_MAX_ROWS = 10_000
-        JSON_REBUILD_EVERY_N_BATCHES = 20
     else:
         MAX_CONCURRENCY = args.concurrency
         PARSE_THREADS = args.parse_workers
         DB_QUEUE_DEPTH = args.queue_depth
         FLUSH_EVERY_N_FILES = args.flush_files
         FLUSH_MAX_ROWS = args.flush_rows
-        JSON_REBUILD_EVERY_N_BATCHES = args.json_every
 
     started = time.perf_counter()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1572,7 +1638,6 @@ async def amain(args: argparse.Namespace) -> None:
 
     conn = open_database(DB_PATH)
     db_lock = threading.RLock()
-    built_movies_this_run: set[str] = set()
 
     try:
         if not args.rebuild:
@@ -1594,8 +1659,9 @@ async def amain(args: argparse.Namespace) -> None:
                 connector = aiohttp.TCPConnector(
                     limit=MAX_CONCURRENCY,
                     limit_per_host=MAX_CONCURRENCY,
-                    ttl_dns_cache=300,
-                    keepalive_timeout=60,
+                    ttl_dns_cache=600,
+                    keepalive_timeout=90,
+                    enable_cleanup_closed=True,
                 )
                 timeout = aiohttp.ClientTimeout(
                     total=REQUEST_TIMEOUT,
@@ -1606,6 +1672,7 @@ async def amain(args: argparse.Namespace) -> None:
                     "User-Agent": "Mozilla/5.0 (BFILMY GitHub Actions)",
                     "Accept": "application/json,text/plain,*/*",
                     "Accept-Encoding": "gzip, deflate",
+                    "Connection": "keep-alive",
                 }
                 async with aiohttp.ClientSession(
                     connector=connector, timeout=timeout, headers=headers,
@@ -1614,7 +1681,6 @@ async def amain(args: argparse.Namespace) -> None:
                         stats = await run_fetch_phase(
                             session, conn, db_lock, pending, state, today,
                         )
-                        built_movies_this_run = stats.built_movies
                     except asyncio.CancelledError:
                         log.warning("Fetch cancelled")
                         state.save()
@@ -1626,9 +1692,7 @@ async def amain(args: argparse.Namespace) -> None:
 
         with db_lock:
             with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-                conn.execute("PRAGMA journal_mode=DELETE").fetchone()
-                conn.execute("PRAGMA synchronous=OFF").fetchone()
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchall()
 
             t = time.perf_counter()
             log.info("Running ANALYZE…")
@@ -1639,15 +1703,9 @@ async def amain(args: argparse.Namespace) -> None:
             log.info("ANALYZE finished in %.1fs", time.perf_counter() - t)
 
         # ---- FINAL BUILD PHASE -------------------------------------
-        # In incremental mode, `built_movies_this_run` is small.
-        # In --rebuild mode it's empty, so we rebuild everything.
-        # Otherwise it's usually empty because the fetch phase already
-        # rebuilt everything it touched.
-        log.info("")
-        log.info("================================================")
-        log.info(" FINAL BUILD PHASE")
-        log.info("================================================")
-
+        # Rebuild only dirty movies. In --rebuild, rebuild every known movie.
+        # Dirty state makes this crash-safe: DB/state can survive an interrupted
+        # run without requiring a refetch just to regenerate movie JSONs.
         with db_lock:
             all_movies = [
                 r[0] for r in conn.execute(
@@ -1658,44 +1716,82 @@ async def amain(args: argparse.Namespace) -> None:
         if args.rebuild:
             to_build = all_movies
         else:
-            to_build = [m for m in all_movies
-                        if m not in built_movies_this_run]
+            # State dirty set is authoritative; also include movies affected
+            # by this run in case the in-memory fetch phase is newer than a
+            # persisted state save.
+            to_build = sorted(set(state.dirty) | set(
+                getattr(locals().get("stats", None), "affected_movies", set())
+                if "stats" in locals() else set()
+            ))
 
+        log.info("")
+        log.info("================================================")
+        log.info(" FINAL BUILD PHASE")
+        log.info("================================================")
         log.info(
-            "Movies total=%d  already built this run=%d  remaining=%d",
-            len(all_movies), len(built_movies_this_run), len(to_build),
+            "Movies total=%d dirty=%d to_build=%d",
+            len(all_movies), len(state.dirty), len(to_build),
         )
 
-        total = len(to_build)
+        build_workers = max(1, min(PARSE_THREADS, os.cpu_count() or 2))
         built = 0
+        failed_builds: set[str] = set()
         tb = time.perf_counter()
 
-        for i, movie in enumerate(to_build, 1):
-            t_movie = time.perf_counter()
+        thread_local = threading.local()
+
+        def get_read_conn() -> sqlite3.Connection:
+            c = getattr(thread_local, "conn", None)
+            if c is None:
+                c = sqlite3.connect(
+                    DB_PATH,
+                    timeout=180,
+                    check_same_thread=True,
+                )
+                c.execute("PRAGMA journal_mode=WAL")
+                c.execute("PRAGMA synchronous=NORMAL")
+                c.execute("PRAGMA busy_timeout=180000")
+                c.execute("PRAGMA cache_size=-65536")
+                c.execute("PRAGMA mmap_size=536870912")
+                thread_local.conn = c
+            return c
+
+        def build_one(movie_name: str) -> tuple[str, bool, str | None]:
             try:
-                with db_lock:
-                    if build_movie(conn, movie):
-                        built += 1
+                out = build_movie(get_read_conn(), movie_name)
+                return movie_name, bool(out), None
             except Exception as e:
-                log.warning("[movie error] %s: %s: %s",
-                            movie, type(e).__name__, e)
+                return movie_name, False, f"{type(e).__name__}: {e}"
 
-            dtm = time.perf_counter() - t_movie
-            if dtm > 5.0:
-                log.info("  [slow] %s: %.2fs", movie, dtm)
+        if to_build:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=build_workers,
+                thread_name_prefix="json",
+            ) as pool:
+                futures = [pool.submit(build_one, movie_name) for movie_name in to_build]
+                for i, fut in enumerate(
+                    concurrent.futures.as_completed(futures), 1
+                ):
+                    movie_name, ok, err = fut.result()
+                    if ok:
+                        built += 1
+                    else:
+                        failed_builds.add(movie_name)
+                        log.warning("[movie error] %s: %s", movie_name, err)
 
-            if i % 200 == 0 or i == total:
-                el = time.perf_counter() - tb
-                rate = i / el if el > 0 else 0.0
-                eta = (total - i) / rate if rate > 0 else 0.0
-                log.info("Final build: %d/%d  (%.1f/s, ETA %.0fs, rss=%.0fMB)",
-                         i, total, rate, eta, rss_mb())
-                if i % 500 == 0:
-                    gc.collect()
-                    with db_lock:
-                        with contextlib.suppress(sqlite3.OperationalError):
-                            conn.execute("PRAGMA shrink_memory")
-                await asyncio.sleep(0)
+                    if i % 200 == 0 or i == len(futures):
+                        elapsed = time.perf_counter() - tb
+                        rate = i / elapsed if elapsed > 0 else 0.0
+                        eta = (len(futures) - i) / rate if rate > 0 else 0.0
+                        log.info(
+                            "Final build: %d/%d (%.1f/s, ETA %.0fs, rss=%.0fMB)",
+                            i, len(futures), rate, eta, rss_mb(),
+                        )
+
+        successful_dirty = set(to_build) - failed_builds
+        state.clear_dirty(successful_dirty)
+        if failed_builds:
+            state.mark_dirty(failed_builds)
 
         state.save()
         with db_lock:
@@ -1707,8 +1803,8 @@ async def amain(args: argparse.Namespace) -> None:
         log.info(" DONE")
         log.info("================================================")
         log.info("Run mode                  : %s", mode)
-        log.info("Movies built during fetch : %d", len(built_movies_this_run))
-        log.info("Movies built in final     : %d", built)
+        log.info("Movies rebuilt             : %d", built)
+        log.info("Movies still dirty         : %d", len(state.dirty))
         log.info("Time                      : %.2fs", elapsed)
         log.info("RSS final                 : %.0f MB", rss_mb())
         log.info("Output dir                : %s", OUTPUT_DIR.resolve())
