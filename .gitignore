@@ -1,0 +1,5 @@
+data/_tmp/
+data/*.json.tmp
+__pycache__/
+*.pyc
+.venv/
