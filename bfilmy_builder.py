@@ -488,16 +488,7 @@ def get_ff_hf(sold: int, seats: int) -> tuple[int, int]:
 
 def compact_metric(v) -> list:
     g, t, sh, ff, hf, se, z = v
-    return [
-        round(g, 2),
-        occupancy(t, se),
-        int(sh),
-        int(ff),
-        int(hf),
-        int(t),
-        int(se),
-        int(z),
-    ]
+    return [round(g, 2), int(t), int(sh), int(ff), int(hf), int(se), int(z)]
 
 
 def write_metric(f, v) -> None:
@@ -505,15 +496,7 @@ def write_metric(f, v) -> None:
 
 
 def compact_timewise(g, t, sh, ff, hf, se) -> list:
-    return [
-        int(sh),
-        int(ff),
-        int(hf),
-        int(t),
-        round(g, 2),
-        occupancy(t, se),
-        atp(g, t),
-    ]
+    return [round(g, 2), int(t), int(sh), int(ff), int(hf), int(se)]
 
 
 # ============================================================
@@ -1351,261 +1334,187 @@ def _rows_for_movie(conn: sqlite3.Connection, movie: str) -> tuple[list[tuple], 
 
 
 def build_movie(conn: sqlite3.Connection, movie: str) -> Path | None:
-    """
-    High-throughput movie build.
+    """Build an ultra-compact movie JSON using shared IDs and date indexes.
 
-    Reads all metrics for this movie in ONE SQL query, materializes compact
-    JSON in memory, then performs one atomic file replace.
+    Schema:
+      m  movie title
+      d  dates as YYYYMMDD integers, stored once; arrays use this index
+      ci city-name -> integer ID
+      st state-name -> integer ID
+      ch chain-name -> integer ID
+      v  variants
+
+    Variant fields:
+      f/l format/language
+      b daily boxoffice city rows: date -> [[city_id,state_id,metric], ...]
+      a advance city rows: same structure
+      k daily chain rows: date -> [[chain_id,metric], ...]
+      q advance chain rows
+      t daily timewise: date -> [M,A,E,N] metrics
+      u advance timewise: date -> [M,A,E,N] metrics
+
+    Metric = [gross,tickets,shows,ff,hf,seats,zero_gross].
+    Occupancy and ATP are intentionally not persisted; both are derivable.
+    Daily/state totals are intentionally not persisted; daily = sum cities,
+    state = group cities by state_id.
     """
     raw_rows, variants = _rows_for_movie(conn, movie)
-    if not variants:
+    if not variants or not raw_rows:
         return None
 
-    # A movie can exist in ADVANCE before it has any DAILY/boxoffice data.
-    # Qualify the movie from either mode so an advance-only movie gets a
-    # movie-slug.json immediately.
-    all_dates = [r[2] for r in raw_rows]
-    if not all_dates:
-        return None
-
-    startdate = min(all_dates)
-    lastdate = max(all_dates)
-
-    formats = sorted({f for _, f, _ in variants if f})
-    languages = sorted({l for _, _, l in variants if l})
     slug = slugify(movie)
     if not slug:
         return None
 
-    # variant_data[(fmt,lang)] = {mode: {dim: ...}}
-    variant_data: dict[tuple[str, str], dict[str, dict[str, Any]]] = {
+    all_dates_str = sorted({r[2] for r in raw_rows})
+    date_id = {d: i for i, d in enumerate(all_dates_str)}
+    # YYYYMMDD integer is smaller than repeated ISO strings in the payload.
+    all_dates = [int(d.replace("-", "")) for d in all_dates_str]
+
+    cities: dict[str, int] = {}
+    states: dict[str, int] = {}
+    chains: dict[str, int] = {}
+
+    def assign_id(mapping: dict[str, int], name: str) -> int:
+        x = mapping.get(name)
+        if x is None:
+            x = len(mapping) + 1
+            mapping[name] = x
+        return x
+
+    # Shared dictionaries across all variants/modes of this movie.
+    for mode, dim, date, fmt, lang, entity, state, *_ in raw_rows:
+        if dim == "c":
+            city, state2 = _split_city_entity(entity, state)
+            if city:
+                assign_id(cities, city)
+            if state2:
+                assign_id(states, state2)
+        elif dim == "ch" and entity:
+            assign_id(chains, entity)
+
+    variant_data: dict[tuple[str, str], dict[str, dict[int, Any]]] = {
         (fmt, lang): {
-            "daily": {"d": {}, "c": {}, "ch": {}, "tm": {}},
-            "advance": {"d": {}, "c": {}, "ch": {}, "tm": {}},
+            "b": {}, "a": {}, "k": {}, "q": {}, "t": {}, "u": {}
         }
         for _, fmt, lang in variants
     }
 
-    # Aggregate output for compact summary.
-    summary_f: dict[str, list] = {}
-    summary_l: dict[str, list] = {}
+    slot_id = {"M": 0, "A": 1, "E": 2, "N": 3}
 
     for (
         mode, dim, date, fmt, lang, entity, state,
         gross, tickets, shows, ff, hf, seats, zero_gross
     ) in raw_rows:
-        bucket = variant_data.get((fmt, lang))
-        if bucket is None:
-            bucket = {
-                "daily": {"d": {}, "c": {}, "ch": {}, "tm": {}},
-                "advance": {"d": {}, "c": {}, "ch": {}, "tm": {}},
-            }
-            variant_data[(fmt, lang)] = bucket
-
-        metric = (
-            gross, tickets, shows, ff, hf, seats, zero_gross
+        key = (fmt, lang)
+        data = variant_data.setdefault(
+            key, {"b": {}, "a": {}, "k": {}, "q": {}, "t": {}, "u": {}}
         )
+        di = date_id[date]
+        metric = [
+            round(gross, 2), int(tickets), int(shows),
+            int(ff), int(hf), int(seats), int(zero_gross)
+        ]
 
-        if dim == "d":
-            bucket[mode]["d"][date] = metric
-        elif dim == "c":
+        if dim == "c":
             city, state2 = _split_city_entity(entity, state)
-            # Preserve exact city output when unique; collision handling is
-            # deterministic and lossless.
-            bucket[mode]["c"].setdefault(
-                city, {}
-            ).setdefault(state2 or "", {})[date] = metric
+            if not city:
+                continue
+            ci = cities[city]
+            si = states.get(state2, 0) if state2 else 0
+            bucket = data["b" if mode == "daily" else "a"]
+            bucket.setdefault(di, {})[(ci, si)] = metric
+
         elif dim == "ch":
-            bucket[mode]["ch"].setdefault(entity, {})[date] = metric
+            if entity:
+                chi = chains[entity]
+                bucket = data["k" if mode == "daily" else "q"]
+                bucket.setdefault(di, {})[chi] = metric
+
         elif dim == "tm":
-            bucket[mode]["tm"].setdefault(entity, {})[date] = metric
+            if entity in slot_id:
+                bucket = data["t" if mode == "daily" else "u"]
+                bucket.setdefault(di, {})[slot_id[entity]] = metric
 
-    def add_summary(target: dict[str, list], key: str, metric: tuple) -> None:
-        acc = target.get(key)
-        if acc is None:
-            acc = metric_zero()
-            target[key] = acc
-        add_metric(acc, *metric)
+        # dim == d deliberately ignored: daily totals are derived from cities.
 
-    # Build formatwise/languagewise from daily totals only.
-    # This intentionally uses the already aggregated day rows rather than
-    # summing city rows, preventing geographic duplication.
-    for (fmt, lang), data in variant_data.items():
-        for metric in data["daily"]["d"].values():
-            add_summary(summary_f, fmt, metric) if fmt else None
-            add_summary(summary_l, lang, metric) if lang else None
-
-    def compact_metric_from_tuple(metric: tuple) -> list:
-        return compact_metric(metric)
-
-    def render_citywise(mode_data: dict[str, Any]) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        for city in sorted(mode_data["c"]):
-            states = mode_data["c"][city]
-            # Normal case: one state for this city.
-            if len(states) == 1:
-                state_name, dates = next(iter(states.items()))
-                obj: dict[str, Any] = {}
-                if state_name:
-                    obj["s"] = state_name
-                obj["d"] = {
-                    date: compact_metric_from_tuple(metric)
-                    for date, metric in sorted(dates.items())
-                }
-                out[city] = obj
-            else:
-                # Rare collision-safe representation:
-                # key is city|state, while preserving the same s/d contract.
-                for state_name in sorted(states):
-                    dates = states[state_name]
-                    key = f"{city}|{state_name}" if state_name else city
-                    obj = {}
-                    if state_name:
-                        obj["s"] = state_name
-                    obj["d"] = {
-                        date: compact_metric_from_tuple(metric)
-                        for date, metric in sorted(dates.items())
-                    }
-                    out[key] = obj
+    def render_city(bucket: dict[int, dict[tuple[int, int], list]]) -> list:
+        out = [[] for _ in all_dates]
+        for di, rows in bucket.items():
+            out[di] = [
+                [ci, si, metric]
+                for (ci, si), metric in sorted(rows.items())
+            ]
         return out
 
-    def render_chainwise(mode_data: dict[str, Any]) -> dict[str, Any]:
-        return {
-            chain: {
-                date: compact_metric_from_tuple(metric)
-                for date, metric in sorted(dates.items())
-            }
-            for chain, dates in sorted(mode_data["ch"].items())
-        }
-
-    def render_timewise(mode_data: dict[str, Any]) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        for slot in "MAEN":
-            if slot in mode_data["tm"]:
-                dates = mode_data["tm"][slot]
-                out[slot] = {
-                    date: compact_timewise(*metric[:6])
-                    for date, metric in sorted(dates.items())
-                }
+    def render_chain(bucket: dict[int, dict[int, list]]) -> list:
+        out = [[] for _ in all_dates]
+        for di, rows in bucket.items():
+            out[di] = [[chi, metric] for chi, metric in sorted(rows.items())]
         return out
 
-    def render_mode(mode_data: dict[str, Any]) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-
-        if mode_data["d"]:
-            out["daily"] = {
-                date: compact_metric_from_tuple(metric)
-                for date, metric in sorted(mode_data["d"].items())
-            }
-
-        if mode_data["c"]:
-            out["citywise"] = render_citywise(mode_data)
-
-        if mode_data["ch"]:
-            out["chainwise"] = render_chainwise(mode_data)
-
-        if mode_data["tm"]:
-            out["timewise"] = render_timewise(mode_data)
-
+    def render_time(bucket: dict[int, dict[int, list]]) -> list:
+        out = [None] * len(all_dates)
+        for di, rows in bucket.items():
+            slots = [None, None, None, None]
+            for si, metric in rows.items():
+                if 0 <= si < 4:
+                    slots[si] = metric
+            out[di] = slots
         return out
-
-    # Global totals per mode from daily rows only.
-    totals_raw: dict[str, list] = {}
-    for mode, root in (("daily", "boxoffice"), ("advance", "advance")):
-        total = metric_zero()
-        found = False
-        for (fmt, lang), data in variant_data.items():
-            for metric in data[mode]["d"].values():
-                add_metric(total, *metric)
-                found = True
-        if found:
-            totals_raw[root] = compact_metric(total)
 
     versions = []
+    seen_variants = set()
     for _, fmt, lang in variants:
-        data = variant_data[(fmt, lang)]
-        version: dict[str, Any] = {}
+        key = (fmt, lang)
+        if key in seen_variants:
+            continue
+        seen_variants.add(key)
+        data = variant_data[key]
+        v: dict[str, Any] = {}
         if fmt:
-            version["format"] = fmt
+            v["f"] = fmt
         if lang:
-            version["language"] = lang
-
-        if data["daily"]:
-            block = render_mode(data["daily"])
-            if block:
-                version["boxoffice"] = block
-
-        if data["advance"]["d"] or data["advance"]["c"] or data["advance"]["ch"] or data["advance"]["tm"]:
-            block = render_mode(data["advance"])
-            if block:
-                version["advance"] = block
-
-        # Per-variant totals, not global totals.
-        var_totals: dict[str, list] = {}
-        for mode, root in (("daily", "boxoffice"), ("advance", "advance")):
-            acc = metric_zero()
-            found = False
-            for metric in data[mode]["d"].values():
-                add_metric(acc, *metric)
-                found = True
-            if found:
-                var_totals[root] = compact_metric(acc)
-        if var_totals:
-            version["totals"] = var_totals
-
-        versions.append(version)
+            v["l"] = lang
+        if data["b"]:
+            v["b"] = render_city(data["b"])
+        if data["a"]:
+            v["a"] = render_city(data["a"])
+        if data["k"]:
+            v["k"] = render_chain(data["k"])
+        if data["q"]:
+            v["q"] = render_chain(data["q"])
+        if data["t"]:
+            v["t"] = render_time(data["t"])
+        if data["u"]:
+            v["u"] = render_time(data["u"])
+        versions.append(v)
 
     payload: dict[str, Any] = {
-        "movie": movie,
-        "slug": slug,
-        "formats": formats,
-        "languages": languages,
-        "startdate": startdate,
-        "lastdate": lastdate,
-        "versions": versions,
+        "m": movie,
+        "d": all_dates,
+        "v": versions,
     }
-
-    # Keep the original compact summary contract.
-    if summary_f or summary_l:
-        payload["summary"] = {}
-        if summary_f:
-            payload["summary"]["formatwise"] = {
-                key: compact_metric(val)
-                for key, val in sorted(summary_f.items())
-            }
-        if summary_l:
-            payload["summary"]["languagewise"] = {
-                key: compact_metric(val)
-                for key, val in sorted(summary_l.items())
-            }
+    if cities:
+        payload["ci"] = {name: i for name, i in sorted(cities.items(), key=lambda x: x[1])}
+    if states:
+        payload["st"] = {name: i for name, i in sorted(states.items(), key=lambda x: x[1])}
+    if chains:
+        payload["ch"] = {name: i for name, i in sorted(chains.items(), key=lambda x: x[1])}
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUTPUT_DIR / f"{slug}.json"
     tmp = OUTPUT_DIR / f"{slug}.json.tmp.{os.getpid()}.{threading.get_ident()}"
-
     try:
-        with tmp.open("w", encoding="utf-8", newline="\n",
-                      buffering=FILE_WRITE_BUFFER) as f:
-            json.dump(
-                payload,
-                f,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+        with tmp.open("w", encoding="utf-8", newline="\n", buffering=FILE_WRITE_BUFFER) as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, out)
-    except BaseException:
+    finally:
         with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
-        raise
-
+            tmp.unlink()
     return out
-
-
-# ============================================================
-# JOB PLANNING  (full vs. incremental)
-# ============================================================
 
 def generate_jobs(state: State, today: dt.date, force_full: bool):
     """
