@@ -91,13 +91,28 @@ jobs:
       # The builder creates files under data/, but file creation alone does
       # NOT put them in GitHub. Explicitly stage, commit and push all generated
       # movie JSONs after the final build.
+      # SAFETY NET:
+      # Stage ONLY JSON files under data/, never data/_tmp.
+      # `git add data -- ':!data/_tmp'` can still fail when Git encounters
+      # the ignored _tmp directory, so we explicitly enumerate JSON files.
       - name: Commit and push generated movie JSON
         if: success()
         run: |
           echo "=== GIT SYNC ==="
 
-          # Never stage the huge SQLite/state working directory.
-          git add data -- ':!data/_tmp'
+          mapfile -d '' JSON_FILES < <(
+            find data               -type f               -name '*.json'               ! -path 'data/_tmp/*'               -print0
+          )
+
+          if [ "${#JSON_FILES[@]}" -eq 0 ]; then
+            echo "No generated JSON files found."
+            exit 0
+          fi
+
+          echo "JSON files found: ${#JSON_FILES[@]}"
+
+          # Add only generated JSON files.
+          printf '%s\0' "${JSON_FILES[@]}" | xargs -0 git add --
 
           if git diff --cached --quiet; then
             echo "No generated JSON changes to commit."
