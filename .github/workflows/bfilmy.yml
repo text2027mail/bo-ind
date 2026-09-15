@@ -3,7 +3,6 @@ name: BFILMY Movie JSON Builder
 on:
   workflow_dispatch:
   schedule:
-    # Every 2 hours at minute 0 UTC = :30 IST.
     - cron: '0 */2 * * *'
 
 permissions:
@@ -25,9 +24,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      # IMPORTANT:
-      # GitHub-hosted runners are ephemeral. Persist the SQLite DB + state.json
-      # between runs so normal runs become incremental instead of FULL (1657 jobs).
       - name: Restore BFILMY builder state
         uses: actions/cache/restore@v4
         with:
@@ -42,19 +38,18 @@ jobs:
 
       - name: Show restored state
         run: |
-          echo "=== RESTORED BUILDER STATE ==="
+          echo "=== RESTORED STATE ==="
           if [ -f data/_tmp/state.json ]; then
-            echo "state.json: FOUND"
-            wc -c data/_tmp/state.json
+            echo "state.json FOUND"
           else
-            echo "state.json: NOT FOUND (first/full run)"
+            echo "state.json NOT FOUND"
           fi
 
           if [ -f data/_tmp/bfilmy.sqlite3 ]; then
-            echo "SQLite DB: FOUND"
+            echo "SQLite FOUND"
             du -h data/_tmp/bfilmy.sqlite3
           else
-            echo "SQLite DB: NOT FOUND (first/full run)"
+            echo "SQLite NOT FOUND"
           fi
 
       - name: Setup Python
@@ -71,13 +66,14 @@ jobs:
       - name: Run BFILMY builder
         env:
           PYTHONUNBUFFERED: '1'
+          GITHUB_ACTIONS: 'true'
         run: |
           if [ -f bfilmy_builder.py ]; then
             BUILDER="bfilmy_builder.py"
           elif [ -f bfilmy_builder_live_checkpoint.py ]; then
             BUILDER="bfilmy_builder_live_checkpoint.py"
           else
-            echo "ERROR: BFILMY builder Python file not found."
+            echo "ERROR: BFILMY builder not found"
             exit 1
           fi
 
@@ -91,8 +87,32 @@ jobs:
             --flush-rows 75000 \
             --push-every 20
 
-      # Always save the latest state under a NEW key.
-      # The next run restores the newest matching partial key.
+      # SAFETY NET:
+      # The builder creates files under data/, but file creation alone does
+      # NOT put them in GitHub. Explicitly stage, commit and push all generated
+      # movie JSONs after the final build.
+      - name: Commit and push generated movie JSON
+        if: success()
+        run: |
+          echo "=== GIT SYNC ==="
+
+          # Never stage the huge SQLite/state working directory.
+          git add data -- ':!data/_tmp'
+
+          if git diff --cached --quiet; then
+            echo "No generated JSON changes to commit."
+            exit 0
+          fi
+
+          echo "Changed files:"
+          git diff --cached --name-only | head -100
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "chore: update BFILMY movie JSON data"
+          git push
+
       - name: Save BFILMY builder state
         if: always()
         uses: actions/cache/save@v4
@@ -104,14 +124,11 @@ jobs:
             data/_tmp/bfilmy.sqlite3-shm
           key: bfilmy-builder-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
 
-      - name: Final state
+      - name: Final status
         if: always()
         run: |
-          echo "=== FINAL BUILDER STATE ==="
-          if [ -f data/_tmp/state.json ]; then
-            echo "state.json: $(wc -c < data/_tmp/state.json) bytes"
-          fi
-          if [ -f data/_tmp/bfilmy.sqlite3 ]; then
-            echo "SQLite: $(du -h data/_tmp/bfilmy.sqlite3 | cut -f1)"
-          fi
+          echo "=== FINAL STATUS ==="
+          echo "Generated data:"
+          find data -maxdepth 2 -type f ! -path 'data/_tmp/*' | wc -l || true
+          echo "Git status:"
           git status --short
