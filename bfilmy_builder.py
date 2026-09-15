@@ -1197,11 +1197,8 @@ async def run_fetch_phase(
             finally:
                 checkpoint_queue.task_done()
 
-    async def report_throttled(force=False):
-        nonlocal last_report
+    async def report_progress(force=False):
         now = time.perf_counter()
-        if not force and now - last_report < 5.0:
-            return
         elapsed = now - t0
         rate = stats.done / elapsed if elapsed > 0 else 0.0
         eta = (total - stats.done) / rate if rate > 0 else 0.0
@@ -1212,9 +1209,22 @@ async def run_fetch_phase(
             stats.done, total, rate, eta,
             db_queue.qsize(), DB_QUEUE_DEPTH, rss_mb(),
         )
-        last_report = now
+
+    async def heartbeat():
+        # Independent from worker completion. This guarantees visible output
+        # even while the initial batch of HTTP downloads/parsers is still busy.
+        while True:
+            await asyncio.sleep(5)
+            await report_progress()
 
     checkpoint_task = asyncio.create_task(checkpoint_monitor())
+    heartbeat_task = asyncio.create_task(heartbeat())
+
+    log.info(
+        "  fetch workers started: %d tasks, concurrency=%d; "
+        "heartbeat=5s",
+        total, MAX_CONCURRENCY,
+    )
 
     async def worker(date, mode, url):
         async with sem:
@@ -1252,10 +1262,10 @@ async def run_fetch_phase(
                             await checkpoint_queue.put(True)
                         last_checkpoint_bucket = bucket
 
-                await report_throttled()
 
     try:
         tasks = [asyncio.create_task(worker(d, m, u)) for d, m, u in plan]
+        await report_progress(force=True)
         await asyncio.gather(*tasks, return_exceptions=True)
 
         # Finish queued 20-job checkpoints.
@@ -1269,6 +1279,11 @@ async def run_fetch_phase(
             await checkpoint_queue.join()
 
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+
         if checkpoint_task is not None:
             await checkpoint_queue.put(None)
             await checkpoint_task
@@ -1279,7 +1294,7 @@ async def run_fetch_phase(
         parse_pool.shutdown(wait=True)
         async with state_lock:
             state.save()
-        await report_throttled(force=True)
+        await report_progress(force=True)
 
     log.info(
         "Fetch complete: ok=%d miss=%d fail=%d rows=%d batches=%d "
