@@ -1,138 +1,55 @@
-name: Build BFILMY data
+name: BFILMY Movie JSON Builder
 
 on:
-  schedule:
-    # 06:00 UTC daily = 11:30 IST
-    - cron: '0 6 * * *'
   workflow_dispatch:
-    inputs:
-      fresh:
-        description: 'Wipe state + DB and refetch everything'
-        type: boolean
-        default: false
-      rebuild:
-        description: 'Skip fetch, rebuild ALL movie JSONs from cached DB'
-        type: boolean
-        default: false
-      force_full:
-        description: 'Ignore incremental mode; treat as a full historical fetch'
-        type: boolean
-        default: false
+  schedule:
+    # Every 2 hours at minute 0 (UTC).
+    # 05:30, 07:30, 09:30, ... IST.
+    - cron: '0 */2 * * *'
 
 permissions:
   contents: write
 
 concurrency:
-  group: bfilmy-builder
+  group: bfilmy-movie-json-builder
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout main
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: '3.12'
+          cache: pip
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install aiohttp ijson
 
-      - name: Verify ijson C backend
-        run: python -c "import ijson.backends.yajl2_c; print('yajl2_c OK')"
-
-      # --------------------------------------------------------------
-      # Restore the SQLite DB + state.json from the most recent cache.
-      #
-      # The key includes github.run_id so each run writes a NEW cache
-      # entry. restore-keys: picks the most recent bfilmy-state-* entry
-      # as a fallback, so the next run always restores the last state.
-      # --------------------------------------------------------------
-      - name: Restore state from cache
-        uses: actions/cache@v4
-        with:
-          path: data/_tmp
-          key: bfilmy-state-${{ github.run_id }}
-          restore-keys: |
-            bfilmy-state-
-
-      - name: Report restored state
-        run: |
-          if [ -f data/_tmp/state.json ]; then
-            echo "state.json present ($(stat -c%s data/_tmp/state.json) bytes)"
-          else
-            echo "No cached state — will run FULL historical fetch"
-          fi
-          if [ -f data/_tmp/bfilmy.sqlite3 ]; then
-            echo "DB present ($(du -h data/_tmp/bfilmy.sqlite3 | cut -f1))"
-          else
-            echo "No cached DB — will build from scratch"
-          fi
-
-      # --------------------------------------------------------------
-      # Build
-      # --------------------------------------------------------------
-      - name: Build data
+      - name: Run BFILMY builder
         env:
-          FRESH: ${{ inputs.fresh && '--fresh' || '' }}
-          REBUILD: ${{ inputs.rebuild && '--rebuild' || '' }}
-          FORCE_FULL: ${{ inputs.force_full && '--force-full' || '' }}
+          PYTHONUNBUFFERED: '1'
         run: |
-          set -o pipefail
-          python bfilmy_builder.py $FRESH $REBUILD $FORCE_FULL 2>&1 \
-            | tee data/_tmp/run.log
-          exit ${PIPESTATUS[0]}
+          python bfilmy_builder.py \
+            --concurrency 80 \
+            --parse-workers 3 \
+            --queue-depth 24 \
+            --flush-files 40 \
+            --flush-rows 75000 \
+            --push-every 20
 
-      # --------------------------------------------------------------
-      # Publish the JSONs to main
-      # --------------------------------------------------------------
-      - name: Count output
-        id: count
-        run: |
-          n=$(find data -maxdepth 1 -name '*.json' | wc -l)
-          echo "n=$n" >> "$GITHUB_OUTPUT"
-          echo "Total movie JSONs: $n"
-
-      - name: Commit and push JSONs
-        if: steps.count.outputs.n != '0'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A data/
-          if git diff --cached --quiet; then
-            echo "No JSON changes to commit"
-          else
-            git commit -m "data: refresh $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git push
-          fi
-
-      # --------------------------------------------------------------
-      # Persist the updated cache even if build failed partway,
-      # so the next run resumes instead of restarting from zero.
-      # actions/cache@v4 does this automatically because our key is
-      # unique (contains run_id).
-      # --------------------------------------------------------------
-
-      - name: Show state size
+      - name: Show git status
         if: always()
-        run: du -sh data/_tmp || true
-
-      - name: Upload run log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bfilmy-run-log
-          path: data/_tmp/run.log
-          retention-days: 7
-          if-no-files-found: ignore
+        run: |
+          git status --short
