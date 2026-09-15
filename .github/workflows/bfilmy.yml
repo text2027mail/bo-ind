@@ -100,27 +100,31 @@ jobs:
         run: |
           echo "=== GIT SYNC ==="
 
+          # Stage ONLY JSON files. Never stage the huge builder state/SQLite.
           mapfile -d '' JSON_FILES < <(
-            find data               -type f               -name '*.json'               ! -path 'data/_tmp/*'               -print0
+            find data \
+              -type f \
+              -name '*.json' \
+              ! -path 'data/_tmp/*' \
+              -print0
           )
 
+          echo "JSON files present: ${#JSON_FILES[@]}"
+
           if [ "${#JSON_FILES[@]}" -eq 0 ]; then
-            echo "No generated JSON files found."
+            echo "No JSON files found."
             exit 0
           fi
 
-          echo "JSON files found: ${#JSON_FILES[@]}"
-
-          # Add only generated JSON files.
           printf '%s\0' "${JSON_FILES[@]}" | xargs -0 git add --
 
           if git diff --cached --quiet; then
-            echo "No generated JSON changes to commit."
+            echo "No JSON changes to commit."
             exit 0
           fi
 
-          echo "Changed files:"
-          git diff --cached --name-only | head -100
+          echo "Files to push:"
+          git diff --cached --name-only | sed -n '1,120p'
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
