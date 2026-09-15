@@ -54,6 +54,7 @@ import re
 import resource
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -89,6 +90,10 @@ DB_QUEUE_DEPTH = 24
 
 FLUSH_EVERY_N_FILES = 40
 FLUSH_MAX_ROWS = 75_000
+
+# Live checkpoint publishing: build/push dirty movie JSONs every N completed fetch jobs.
+LIVE_PUSH_EVERY = 20
+LIVE_BUILD_WORKERS = 2
 
 REQUEST_TIMEOUT = 90
 CONNECT_TIMEOUT = 20
@@ -945,6 +950,9 @@ class Stats:
         self.affected_movies: set[str] = set()
 
 
+# Special queue control item: flush all pending DB writes immediately.
+DB_FLUSH = object()
+
 # ============================================================
 # DB WRITER TASK
 # ============================================================
@@ -1006,6 +1014,11 @@ async def db_writer_task(
             queue.task_done()
             return
 
+        if item is DB_FLUSH:
+            await flush_db()
+            queue.task_done()
+            continue
+
         pending.append(item)
         pending_rows += len(item[2])
 
@@ -1013,11 +1026,116 @@ async def db_writer_task(
             await flush_db()
 
 
+
+# ============================================================
+# LIVE CHECKPOINT / GIT PUBLISH
+# ============================================================
+
+def git_publish_movie_files(paths: list[Path], checkpoint_no: int) -> bool:
+    if not paths:
+        return False
+
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=15,
+        )
+        if probe.returncode != 0:
+            log.info(
+                "Live checkpoint #%d: not a git worktree; kept JSONs locally.",
+                checkpoint_no,
+            )
+            return False
+
+        rel_paths = []
+        cwd = Path.cwd().resolve()
+        for p in paths:
+            try:
+                rel_paths.append(str(p.resolve().relative_to(cwd)))
+            except ValueError:
+                rel_paths.append(str(p))
+
+        subprocess.run(
+            ["git", "add", "--", *rel_paths],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+        )
+
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+
+        if diff.returncode != 0:
+            subprocess.run(
+                ["git", "commit", "-m",
+                 f"chore: live movie JSON checkpoint {checkpoint_no}"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+            )
+
+        # Always push. This also recovers from a previous checkpoint where
+        # commit succeeded but push failed.
+        subprocess.run(
+            ["git", "push"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=180,
+        )
+
+        log.info(
+            "Live checkpoint #%d: git push successful (%d movie JSON paths).",
+            checkpoint_no,
+            len(rel_paths),
+        )
+        return True
+
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or "").strip().replace("\n", " ")
+        log.warning(
+            "Live checkpoint #%d git push failed: %s",
+            checkpoint_no,
+            detail[:500],
+        )
+        return False
+    except Exception as e:
+        log.warning(
+            "Live checkpoint #%d git publish error: %s: %s",
+            checkpoint_no,
+            type(e).__name__,
+            e,
+        )
+        return False
+
+
 # ============================================================
 # FETCH PHASE
 # ============================================================
 
-async def run_fetch_phase(session, conn, db_lock, plan, state, today):
+async def run_fetch_phase(
+    session,
+    conn,
+    db_lock,
+    plan,
+    state,
+    today,
+    live_checkpoint=None,
+    live_push_every=LIVE_PUSH_EVERY,
+):
     loop = asyncio.get_running_loop()
 
     parse_pool = concurrent.futures.ThreadPoolExecutor(
@@ -1048,6 +1166,37 @@ async def run_fetch_phase(session, conn, db_lock, plan, state, today):
     t0 = time.perf_counter()
     last_report = t0
 
+    checkpoint_queue: asyncio.Queue = asyncio.Queue()
+    checkpoint_task = None
+    last_checkpoint_bucket = 0
+
+    async def checkpoint_monitor():
+        checkpoint_no = 0
+        while True:
+            item = await checkpoint_queue.get()
+            if item is None:
+                checkpoint_queue.task_done()
+                return
+            checkpoint_no += 1
+            try:
+                # Force the writer to flush its in-memory batch first.
+                # DB_FLUSH is FIFO after already-queued jobs, so the following
+                # join cannot deadlock behind FLUSH_EVERY_N_FILES.
+                await db_queue.put(DB_FLUSH)
+                await db_queue.join()
+                if live_checkpoint is not None:
+                    await live_checkpoint(checkpoint_no)
+            except Exception as e:
+                # Never kill the fetch run because of a checkpoint/push problem.
+                log.warning(
+                    "Live checkpoint #%d failed (non-fatal): %s: %s",
+                    checkpoint_no,
+                    type(e).__name__,
+                    e,
+                )
+            finally:
+                checkpoint_queue.task_done()
+
     async def report_throttled(force=False):
         nonlocal last_report
         now = time.perf_counter()
@@ -1064,6 +1213,8 @@ async def run_fetch_phase(session, conn, db_lock, plan, state, today):
             db_queue.qsize(), DB_QUEUE_DEPTH, rss_mb(),
         )
         last_report = now
+
+    checkpoint_task = asyncio.create_task(checkpoint_monitor())
 
     async def worker(date, mode, url):
         async with sem:
@@ -1093,12 +1244,35 @@ async def run_fetch_phase(session, conn, db_lock, plan, state, today):
                     with contextlib.suppress(OSError):
                         os.remove(path)
                 stats.done += 1
+
+                if live_checkpoint is not None and live_push_every > 0:
+                    bucket = stats.done // live_push_every
+                    if bucket > last_checkpoint_bucket:
+                        for _ in range(last_checkpoint_bucket + 1, bucket + 1):
+                            await checkpoint_queue.put(True)
+                        last_checkpoint_bucket = bucket
+
                 await report_throttled()
 
     try:
         tasks = [asyncio.create_task(worker(d, m, u)) for d, m, u in plan]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Finish queued 20-job checkpoints.
+        await checkpoint_queue.join()
+
+        # Publish the tail too, even when the run ends between boundaries.
+        if live_checkpoint is not None and stats.done and (
+            stats.done % max(live_push_every, 1) != 0
+        ):
+            await checkpoint_queue.put(True)
+            await checkpoint_queue.join()
+
     finally:
+        if checkpoint_task is not None:
+            await checkpoint_queue.put(None)
+            await checkpoint_task
+
         await db_queue.join()
         await db_queue.put(None)
         await writer
@@ -1544,6 +1718,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--flush-files", type=int, default=FLUSH_EVERY_N_FILES)
     p.add_argument("--flush-rows", type=int, default=FLUSH_MAX_ROWS)
     p.add_argument("--queue-depth", type=int, default=DB_QUEUE_DEPTH)
+    p.add_argument(
+        "--push-every",
+        type=int,
+        default=LIVE_PUSH_EVERY,
+        help="Build/push dirty movie JSONs after every N completed fetch jobs; 0 disables live publishing.",
+    )
     p.add_argument("--low-memory", action="store_true",
                    help="Ultra-low-memory preset (Replit free tier).")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -1556,7 +1736,7 @@ def parse_args() -> argparse.Namespace:
 
 async def amain(args: argparse.Namespace) -> None:
     global MAX_CONCURRENCY, PARSE_THREADS, DB_QUEUE_DEPTH
-    global FLUSH_EVERY_N_FILES, FLUSH_MAX_ROWS
+    global FLUSH_EVERY_N_FILES, FLUSH_MAX_ROWS, LIVE_PUSH_EVERY
 
     if args.low_memory:
         MAX_CONCURRENCY = 6
@@ -1564,12 +1744,14 @@ async def amain(args: argparse.Namespace) -> None:
         DB_QUEUE_DEPTH = 3
         FLUSH_EVERY_N_FILES = 10
         FLUSH_MAX_ROWS = 10_000
+        LIVE_PUSH_EVERY = max(0, args.push_every)
     else:
         MAX_CONCURRENCY = args.concurrency
         PARSE_THREADS = args.parse_workers
         DB_QUEUE_DEPTH = args.queue_depth
         FLUSH_EVERY_N_FILES = args.flush_files
         FLUSH_MAX_ROWS = args.flush_rows
+        LIVE_PUSH_EVERY = max(0, args.push_every)
 
     started = time.perf_counter()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1585,6 +1767,7 @@ async def amain(args: argparse.Namespace) -> None:
     log.info("Flush policy    : %d files OR %d rows",
              FLUSH_EVERY_N_FILES, FLUSH_MAX_ROWS)
     log.info("Incremental past: %d days", INCREMENTAL_PAST_DAYS)
+    log.info("Live push every: %d fetches", LIVE_PUSH_EVERY)
     log.info("uvloop          : %s", _HAS_UVLOOP)
     log.info("ijson backend   : %s", detect_ijson_backend())
     log.info("RSS start       : %.0f MB", rss_mb())
@@ -1676,8 +1859,123 @@ async def amain(args: argparse.Namespace) -> None:
                     connector=connector, timeout=timeout, headers=headers,
                 ) as session:
                     try:
+                        async def live_checkpoint(checkpoint_no):
+                            # Only movies currently marked dirty are rebuilt.
+                            # Successful rebuilds clear the dirty bit, so a movie
+                            # changed again later will be rebuilt at a later checkpoint.
+                            with db_lock:
+                                dirty_movies = sorted(state.dirty)
+
+                            if not dirty_movies:
+                                log.info(
+                                    "Live checkpoint #%d: nothing dirty.",
+                                    checkpoint_no,
+                                )
+                                return
+
+                            thread_local_live = threading.local()
+
+                            def get_live_read_conn():
+                                c = getattr(thread_local_live, "conn", None)
+                                if c is None:
+                                    c = sqlite3.connect(
+                                        DB_PATH,
+                                        timeout=180,
+                                        check_same_thread=True,
+                                    )
+                                    c.execute("PRAGMA journal_mode=WAL")
+                                    c.execute("PRAGMA synchronous=NORMAL")
+                                    c.execute("PRAGMA busy_timeout=180000")
+                                    c.execute("PRAGMA cache_size=-32768")
+                                    c.execute("PRAGMA mmap_size=268435456")
+                                    thread_local_live.conn = c
+                                return c
+
+                            def build_live_one(movie_name):
+                                try:
+                                    out = build_movie(
+                                        get_live_read_conn(),
+                                        movie_name,
+                                    )
+                                    return movie_name, out, None
+                                except Exception as e:
+                                    return (
+                                        movie_name,
+                                        None,
+                                        f"{type(e).__name__}: {e}",
+                                    )
+
+                            built_paths = []
+                            failed = set()
+                            t_live = time.perf_counter()
+
+                            with concurrent.futures.ThreadPoolExecutor(
+                                max_workers=max(
+                                    1,
+                                    min(LIVE_BUILD_WORKERS, os.cpu_count() or 2),
+                                ),
+                                thread_name_prefix=f"live-json-{checkpoint_no}",
+                            ) as pool:
+                                futures = [
+                                    pool.submit(build_live_one, movie)
+                                    for movie in dirty_movies
+                                ]
+                                for fut in concurrent.futures.as_completed(futures):
+                                    movie_name, out, err = fut.result()
+                                    if out is not None:
+                                        built_paths.append(out)
+                                    else:
+                                        failed.add(movie_name)
+                                        log.warning(
+                                            "[live movie error] %s: %s",
+                                            movie_name,
+                                            err,
+                                        )
+
+                            successful = set(dirty_movies) - failed
+
+                            push_ok = True
+                            if built_paths and os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+                                push_ok = await loop.run_in_executor(
+                                    None,
+                                    git_publish_movie_files,
+                                    built_paths,
+                                    checkpoint_no,
+                                )
+
+                            # On GitHub, only clear dirty after the checkpoint
+                            # is actually pushed. A failed push therefore gets
+                            # retried at the next checkpoint/run.
+                            if push_ok:
+                                state.clear_dirty(successful)
+                            else:
+                                state.mark_dirty(successful)
+
+                            if failed:
+                                state.mark_dirty(failed)
+
+                            state.save()
+
+                            log.info(
+                                "Live checkpoint #%d: dirty=%d built=%d failed=%d pushed=%s in %.1fs rss=%.0fMB",
+                                checkpoint_no,
+                                len(dirty_movies),
+                                len(built_paths),
+                                len(failed),
+                                push_ok,
+                                time.perf_counter() - t_live,
+                                rss_mb(),
+                            )
+
                         stats = await run_fetch_phase(
-                            session, conn, db_lock, pending, state, today,
+                            session,
+                            conn,
+                            db_lock,
+                            pending,
+                            state,
+                            today,
+                            live_checkpoint=live_checkpoint,
+                            live_push_every=LIVE_PUSH_EVERY,
                         )
                     except asyncio.CancelledError:
                         log.warning("Fetch cancelled")
