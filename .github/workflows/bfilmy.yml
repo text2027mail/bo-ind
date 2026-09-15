@@ -3,8 +3,7 @@ name: BFILMY Movie JSON Builder
 on:
   workflow_dispatch:
   schedule:
-    # Every 2 hours at minute 0 (UTC).
-    # 05:30, 07:30, 09:30, ... IST.
+    # Every 2 hours at minute 0 UTC = :30 IST.
     - cron: '0 */2 * * *'
 
 permissions:
@@ -26,6 +25,38 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
+      # IMPORTANT:
+      # GitHub-hosted runners are ephemeral. Persist the SQLite DB + state.json
+      # between runs so normal runs become incremental instead of FULL (1657 jobs).
+      - name: Restore BFILMY builder state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/_tmp/state.json
+            data/_tmp/bfilmy.sqlite3
+            data/_tmp/bfilmy.sqlite3-wal
+            data/_tmp/bfilmy.sqlite3-shm
+          key: bfilmy-builder-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            bfilmy-builder-${{ runner.os }}-${{ github.ref_name }}-
+
+      - name: Show restored state
+        run: |
+          echo "=== RESTORED BUILDER STATE ==="
+          if [ -f data/_tmp/state.json ]; then
+            echo "state.json: FOUND"
+            wc -c data/_tmp/state.json
+          else
+            echo "state.json: NOT FOUND (first/full run)"
+          fi
+
+          if [ -f data/_tmp/bfilmy.sqlite3 ]; then
+            echo "SQLite DB: FOUND"
+            du -h data/_tmp/bfilmy.sqlite3
+          else
+            echo "SQLite DB: NOT FOUND (first/full run)"
+          fi
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -35,13 +66,24 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install aiohttp ijson
+          pip install aiohttp ijson uvloop
 
       - name: Run BFILMY builder
         env:
           PYTHONUNBUFFERED: '1'
         run: |
-          python bfilmy_builder.py \
+          if [ -f bfilmy_builder.py ]; then
+            BUILDER="bfilmy_builder.py"
+          elif [ -f bfilmy_builder_live_checkpoint.py ]; then
+            BUILDER="bfilmy_builder_live_checkpoint.py"
+          else
+            echo "ERROR: BFILMY builder Python file not found."
+            exit 1
+          fi
+
+          echo "Running: ${BUILDER}"
+
+          python -u "${BUILDER}" \
             --concurrency 80 \
             --parse-workers 3 \
             --queue-depth 24 \
@@ -49,7 +91,27 @@ jobs:
             --flush-rows 75000 \
             --push-every 20
 
-      - name: Show git status
+      # Always save the latest state under a NEW key.
+      # The next run restores the newest matching partial key.
+      - name: Save BFILMY builder state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/_tmp/state.json
+            data/_tmp/bfilmy.sqlite3
+            data/_tmp/bfilmy.sqlite3-wal
+            data/_tmp/bfilmy.sqlite3-shm
+          key: bfilmy-builder-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Final state
         if: always()
         run: |
+          echo "=== FINAL BUILDER STATE ==="
+          if [ -f data/_tmp/state.json ]; then
+            echo "state.json: $(wc -c < data/_tmp/state.json) bytes"
+          fi
+          if [ -f data/_tmp/bfilmy.sqlite3 ]; then
+            echo "SQLite: $(du -h data/_tmp/bfilmy.sqlite3 | cut -f1)"
+          fi
           git status --short
