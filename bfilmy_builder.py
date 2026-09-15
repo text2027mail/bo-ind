@@ -1172,12 +1172,10 @@ def build_movie(conn: sqlite3.Connection, movie: str) -> Path | None:
     if not variants:
         return None
 
-    # A movie may be advance-only (unreleased). Do not discard it merely
-    # because it has no daily history yet.
-    all_dates = [
-        r[2] for r in raw_rows
-        if r[1] == "d"
-    ]
+    # A movie can exist in ADVANCE before it has any DAILY/boxoffice data.
+    # Qualify the movie from either mode so an advance-only movie gets a
+    # movie-slug.json immediately.
+    all_dates = [r[2] for r in raw_rows]
     if not all_dates:
         return None
 
